@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .use => {
             if (args.len < 3) fail(out, "missing version");
-            try out.print("{s} {s}\n", .{ @tagName(cmd), args[2] });
+            try use(io, out, init.environ_map, arena, args[2]);
         },
     }
 }
@@ -79,7 +79,8 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     });
 
     const release = index.object.get(requested_version) orelse return error.UnknownVersion;
-    const version = (release.object.get("version") orelse return error.BadRelease).string;
+    // Some old releases have no version field
+    const version = if (release.object.get("version")) |v| v.string else requested_version;
     const date = (release.object.get("date") orelse return error.BadRelease).string;
     const asset = release.object.get(platform) orelse return error.UnsupportedPlatform;
     const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
@@ -122,9 +123,29 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
 
         try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
         cwd.deleteFile(io, archive) catch {};
+
+        if (!std.mem.eql(u8, version, requested_version)) {
+            const alias = try std.fs.path.join(arena, &.{ root, requested_version });
+            cwd.deleteFile(io, alias) catch {};
+            try cwd.symLinkAtomic(io, dest, alias, .{ .is_directory = true });
+        }
+
         return;
     };
     try out.print("already installed {s}\n", .{version});
+}
+
+fn use(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
+    const home = env.get("HOME") orelse return error.HomeNotSet;
+    const sym_link_path = try std.fs.path.join(arena, &.{ home, ".zig/bin" });
+    const target_path = try std.fs.path.join(arena, &.{ home, ".zig/zup", want, "bin" });
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.access(io, target_path, .{}) catch fail(out, "version missing");
+    try cwd.symLinkAtomic(io, target_path, sym_link_path, .{ .is_directory = true });
+
+    try out.print("version {s} is now active\n", .{want});
+    try out.flush();
 }
 
 fn usage(out: *Io.Writer) !void {
