@@ -22,7 +22,11 @@ pub fn main(init: std.process.Init) !void {
     switch (cmd) {
         .help => try usage(out),
         .list => try list(io, out, init.environ_map, arena),
-        .use, .install => {
+        .install => {
+            if (args.len < 3) fail(out, "missing version");
+            try install(io, out, arena, init.gpa, args[2]);
+        },
+        .use => {
             if (args.len < 3) fail(out, "missing version");
             try out.print("{s} {s}\n", .{ @tagName(cmd), args[2] });
         },
@@ -53,6 +57,42 @@ fn list(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.A
     std.mem.sort([]const u8, names.items, {}, lessVersion);
 
     for (names.items) |name| try out.print("{s}\n", .{name});
+}
+
+fn install(io: Io, out: *Io.Writer, arena: std.mem.Allocator, gpa: std.mem.Allocator, want: []const u8) !void {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var body: std.Io.Writer.Allocating = .init(arena);
+    const res = try client.fetch(.{
+        .location = .{ .url = index_url },
+        .response_writer = &body.writer,
+    });
+    if (res.status != .ok) return error.HttpStatus;
+
+    const index = (try std.json.parseFromSlice(std.json.Value, arena, body.written(), .{})).value;
+    const version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
+
+    const platform = try std.fmt.allocPrint(arena, "{s}-{s}", .{
+        @tagName(@import("builtin").cpu.arch),
+        @tagName(@import("builtin").os.tag),
+    });
+
+    const release = index.object.get(version) orelse return error.UnknownVersion;
+    const date = release.object.get("date") orelse return error.BadRelease;
+    const asset = release.object.get(platform) orelse return error.UnsupportedPlatform;
+    const url = asset.object.get("tarball") orelse return error.BadIndex;
+    const size = asset.object.get("size") orelse return error.BadIndex;
+
+    try out.print("version {s}\nplatform {s}\ndate {s}\ntarball {s}\nsize {s}\n", .{
+        version,
+        platform,
+        date.string,
+        url.string,
+        size.string,
+    });
+
+    return;
 }
 
 fn usage(out: *Io.Writer) !void {
@@ -88,6 +128,23 @@ test "semantic versions are correctly ordered" {
     try std.testing.expect(!lessVersion({}, "0.17.0", "0.17.0"));
     try std.testing.expect(lessVersion({}, "0.16.0", "0.17.0-dev.1024"));
     try std.testing.expect(lessVersion({}, "0.17.0-dev.1024", "0.17.0"));
+}
+
+const index_url = "https://ziglang.org/download/index.json";
+
+fn latestStable(index: std.json.Value) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_ver: ?std.SemanticVersion = null;
+    var it = index.object.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, "master")) continue;
+        const v = std.SemanticVersion.parse(e.key_ptr.*) catch continue;
+        if (best_ver == null or v.order(best_ver.?) == .gt) {
+            best_ver = v;
+            best = e.key_ptr.*;
+        }
+    }
+    return best;
 }
 
 // test "simple test" {
