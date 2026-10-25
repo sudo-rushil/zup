@@ -11,17 +11,42 @@ pub fn main(init: std.process.Init) !void {
     defer out.flush() catch {};
 
     if (args.len < 2) {
-        try out.writeAll("usage: zup <command>\n");
+        try usage(out);
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "list")) {
-        try out.print("list: {d} extra args\n", .{args.len - 2});
-    } else {
-        try out.print("unknown command: {s}\n", .{args[1]});
-        try out.flush();
-        std.process.exit(2);
+    const Command = enum { list, use, install, help };
+
+    const cmd = std.meta.stringToEnum(Command, args[1]) orelse fail(out, "unknown command");
+    switch (cmd) {
+        .help => try usage(out),
+        .list => try usage(out),
+        .use, .install => {
+            if (args.len < 3) fail(out, "missing version");
+            try out.print("{s} {s}\n", .{ @tagName(cmd), args[2] });
+        },
     }
+}
+
+fn usage(out: *Io.Writer) !void {
+    try out.writeAll(
+        \\Usage: zup [command]
+        \\
+        \\Commands:
+        \\
+        \\  install <version>    install zig/zls
+        \\  use <version>        use specified zig/zls version
+        \\  list                 list all available versions
+        \\  help                 display this help text
+        \\
+    );
+}
+
+fn fail(out: *Io.Writer, msg: []const u8) noreturn {
+    out.print("{s}\n\n", .{msg}) catch {};
+    usage(out) catch {};
+    out.flush() catch {};
+    std.process.exit(2);
 }
 
 test "simple test" {
