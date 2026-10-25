@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         .list => try list(io, out, init.environ_map, arena),
         .install => {
             if (args.len < 3) fail(out, "missing version");
-            try install(io, out, arena, init.gpa, args[2]);
+            try install(io, out, init.environ_map, arena, init.gpa, args[2]);
         },
         .use => {
             if (args.len < 3) fail(out, "missing version");
@@ -59,7 +59,7 @@ fn list(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.A
     for (names.items) |name| try out.print("{s}\n", .{name});
 }
 
-fn install(io: Io, out: *Io.Writer, arena: std.mem.Allocator, gpa: std.mem.Allocator, want: []const u8) !void {
+fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, gpa: std.mem.Allocator, want: []const u8) !void {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
@@ -71,28 +71,60 @@ fn install(io: Io, out: *Io.Writer, arena: std.mem.Allocator, gpa: std.mem.Alloc
     if (res.status != .ok) return error.HttpStatus;
 
     const index = (try std.json.parseFromSlice(std.json.Value, arena, body.written(), .{})).value;
-    const version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
+    const requested_version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
 
     const platform = try std.fmt.allocPrint(arena, "{s}-{s}", .{
         @tagName(@import("builtin").cpu.arch),
         @tagName(@import("builtin").os.tag),
     });
 
-    const release = index.object.get(version) orelse return error.UnknownVersion;
-    const date = release.object.get("date") orelse return error.BadRelease;
+    const release = index.object.get(requested_version) orelse return error.UnknownVersion;
+    const version = (release.object.get("version") orelse return error.BadRelease).string;
+    const date = (release.object.get("date") orelse return error.BadRelease).string;
     const asset = release.object.get(platform) orelse return error.UnsupportedPlatform;
-    const url = asset.object.get("tarball") orelse return error.BadIndex;
-    const size = asset.object.get("size") orelse return error.BadIndex;
+    const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
+    const size = (asset.object.get("size") orelse return error.BadIndex).string;
 
     try out.print("version {s}\nplatform {s}\ndate {s}\ntarball {s}\nsize {s}\n", .{
         version,
         platform,
-        date.string,
-        url.string,
-        size.string,
+        date,
+        url,
+        size,
     });
+    try out.flush();
 
-    return;
+    const home = env.get("HOME") orelse return error.HomeNotSet;
+    const root = try std.fs.path.join(arena, &.{ home, ".zig/zup" });
+    const dest = try std.fs.path.join(arena, &.{ root, version });
+    const staging = try std.fmt.allocPrint(arena, "{s}/{s}.installing", .{ root, version });
+    const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ root, version });
+
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, root);
+
+    cwd.access(io, dest, .{}) catch {
+        cwd.deleteTree(io, staging) catch {};
+        try cwd.createDirPath(io, staging);
+
+        try out.print("downloading {s}\n", .{url});
+        try out.flush();
+        try download(io, &client, url, archive);
+        try out.print("extracting\n", .{});
+        try out.flush();
+        try extract(io, archive, staging);
+
+        const bin = try std.fs.path.join(arena, &.{ staging, "bin" });
+        try cwd.createDirPath(io, bin);
+        const zig_src = try std.fs.path.join(arena, &.{ staging, "zig" });
+        const zig_dst = try std.fs.path.join(arena, &.{ bin, "zig" });
+        try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
+
+        try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
+        cwd.deleteFile(io, archive) catch {};
+        return;
+    };
+    try out.print("already installed {s}\n", .{version});
 }
 
 fn usage(out: *Io.Writer) !void {
@@ -145,6 +177,29 @@ fn latestStable(index: std.json.Value) ?[]const u8 {
         }
     }
     return best;
+}
+
+fn download(io: Io, client: *std.http.Client, url: []const u8, path: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var fw: Io.File.Writer = .init(file, io, &buf);
+    const res = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &fw.interface,
+    });
+    try fw.interface.flush();
+    if (res.status != .ok) return error.HttpStatus;
+}
+
+fn extract(io: Io, archive: []const u8, dir: []const u8) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "tar", "-xf", archive, "-C", dir, "--strip-components=1" },
+        .stdin = .ignore,
+    });
+    const term = try child.wait(io);
+    if (!term.success()) return error.TarFailed;
 }
 
 // test "simple test" {
