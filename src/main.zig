@@ -2,29 +2,26 @@ const std = @import("std");
 const Io = std.Io;
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+    var buf: [4096]u8 = undefined;
+    var fw: Io.File.Writer = .init(.stdout(), io, &buf);
+    const out = &fw.interface;
+    defer out.flush() catch {};
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    if (args.len < 2) {
+        try out.writeAll("usage: zup <command>\n");
+        return;
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
-
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    if (std.mem.eql(u8, args[1], "list")) {
+        try out.print("list: {d} extra args\n", .{args.len - 2});
+    } else {
+        try out.print("unknown command: {s}\n", .{args[1]});
+        try out.flush();
+        std.process.exit(2);
+    }
 }
 
 test "simple test" {
