@@ -107,9 +107,11 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     cwd.access(io, dest, .{}) catch {
         cwd.deleteTree(io, staging) catch {};
         try cwd.createDirPath(io, staging);
+        errdefer cwd.deleteTree(io, staging) catch {};
 
         try out.print("downloading {s}\n", .{url});
         try out.flush();
+        errdefer cwd.deleteFile(io, archive) catch {};
         try download(io, &client, url, archive);
         try out.print("extracting\n", .{});
         try out.flush();
@@ -120,6 +122,8 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
         const zig_src = try std.fs.path.join(arena, &.{ staging, "zig" });
         const zig_dst = try std.fs.path.join(arena, &.{ bin, "zig" });
         try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
+
+        try downloadZls(io, out, &client, arena, version, bin);
 
         try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
         cwd.deleteFile(io, archive) catch {};
@@ -223,41 +227,63 @@ fn extract(io: Io, archive: []const u8, dir: []const u8) !void {
     if (!term.success()) return error.TarFailed;
 }
 
-// test "simple test" {
-//     const gpa = std.testing.allocator;
-//     var list: std.ArrayList(i32) = .empty;
-//     defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-//     try list.append(gpa, 42);
-//     try std.testing.expectEqual(@as(i32, 42), list.pop());
-// }
-//
-// test "fuzz example" {
-//     try std.testing.fuzz({}, testOne, .{});
-// }
-//
-// fn testOne(context: void, smith: *std.testing.Smith) !void {
-//     _ = context;
-//     // Try command `zig build test --fuzz -Doptimize=ReleaseFast` to see if it manages to fail this test case!
-//
-//     const gpa = std.testing.allocator;
-//     var list: std.ArrayList(u8) = .empty;
-//     defer list.deinit(gpa);
-//     while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-//         .add_data => {
-//             const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-//             smith.bytes(slice);
-//         },
-//         .dup_data => {
-//             if (list.items.len == 0) continue;
-//             if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-//             const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-//             const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-//             try list.appendSlice(gpa, list.items[off..][0..len]);
-//             try std.testing.expectEqualSlices(
-//                 u8,
-//                 list.items[off..][0..len],
-//                 list.items[list.items.len - len ..],
-//             );
-//         },
-//     };
-// }
+fn downloadZls(io: Io, out: *Io.Writer, client: *std.http.Client, arena: std.mem.Allocator, version: []const u8, dir: []const u8) !void {
+    var url: std.Io.Writer.Allocating = .init(arena);
+    try url.writer.print("https://releases.zigtools.org/v1/zls/select-version?zig_version={f}&compatibility=only-runtime", .{
+        std.fmt.alt(std.Uri.Component{ .raw = version }, .formatEscaped),
+    });
+
+    var body: std.Io.Writer.Allocating = .init(arena);
+    const res = try client.fetch(.{
+        .location = .{ .url = url.written() },
+        .response_writer = &body.writer,
+    });
+    if (res.status != .ok) return error.HttpStatus;
+
+    const index = (try std.json.parseFromSlice(std.json.Value, arena, body.written(), .{})).value;
+
+    if (index.object.get("message")) |msg| {
+        try out.print("error: {s}\n", .{msg.string});
+        return error.ZlsUnsupported;
+    }
+
+    const platform = try std.fmt.allocPrint(arena, "{s}-{s}", .{
+        @tagName(@import("builtin").cpu.arch),
+        @tagName(@import("builtin").os.tag),
+    });
+
+    const zls_version = (index.object.get("version") orelse return error.UnknownVersion).string;
+    const date = (index.object.get("date") orelse return error.BadRelease).string;
+    const asset = index.object.get(platform) orelse return error.UnsupportedPlatform;
+    const zls_url = (asset.object.get("tarball") orelse return error.BadIndex).string;
+    const zls_size = (asset.object.get("size") orelse return error.BadIndex).string;
+
+    try out.print("zls version {s}\ndate {s}\ntarball {s}\nsize {s}\n", .{
+        zls_version,
+        date,
+        zls_url,
+        zls_size,
+    });
+    try out.flush();
+
+    const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ dir, version });
+    var file = try std.Io.Dir.cwd().createFile(io, archive, .{});
+
+    var buf: [64 * 1024]u8 = undefined;
+    var fw: Io.File.Writer = .init(file, io, &buf);
+    const archive_res = try client.fetch(.{
+        .location = .{ .url = zls_url },
+        .response_writer = &fw.interface,
+    });
+    try fw.interface.flush();
+    if (archive_res.status != .ok) return error.HttpStatus;
+    file.close(io);
+
+    var child = try std.process.spawn(io, .{ .argv = &.{ "tar", "-xf", archive, "-C", dir }, .stdin = .ignore });
+    const term = try child.wait(io);
+    if (!term.success()) return error.TarFailed;
+
+    std.Io.Dir.cwd().deleteFile(io, archive) catch {};
+
+    return;
+}
