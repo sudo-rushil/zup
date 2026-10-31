@@ -1,5 +1,10 @@
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
+
+const platform = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag);
+const zig_index_url = "https://ziglang.org/download/index.json";
+const zls_index_url = "https://releases.zigtools.org/v1/zls/select-version?zig_version={f}&compatibility=only-runtime";
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -65,18 +70,13 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
 
     var body: std.Io.Writer.Allocating = .init(arena);
     const res = try client.fetch(.{
-        .location = .{ .url = index_url },
+        .location = .{ .url = zig_index_url },
         .response_writer = &body.writer,
     });
     if (res.status != .ok) return error.HttpStatus;
 
     const index = (try std.json.parseFromSlice(std.json.Value, arena, body.written(), .{})).value;
     const requested_version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
-
-    const platform = try std.fmt.allocPrint(arena, "{s}-{s}", .{
-        @tagName(@import("builtin").cpu.arch),
-        @tagName(@import("builtin").os.tag),
-    });
 
     const release = index.object.get(requested_version) orelse return error.UnknownVersion;
     // Some old releases have no version field
@@ -86,12 +86,12 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
     const size = (asset.object.get("size") orelse return error.BadIndex).string;
 
-    try out.print("version {s}\nplatform {s}\ndate {s}\ntarball {s}\nsize {s}\n", .{
+    try out.print("version {s}\nplatform {s}\ndate {s}\ntarball {s}\nsize {Bi:.0}\n", .{
         version,
         platform,
         date,
         url,
-        size,
+        try std.fmt.parseInt(u32, size, 10),
     });
     try out.flush();
 
@@ -115,7 +115,7 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
         try download(io, &client, url, archive);
         try out.print("extracting\n", .{});
         try out.flush();
-        try extract(io, archive, staging);
+        try extract(io, archive, staging, .{ .strip_components = 1 });
 
         const bin = try std.fs.path.join(arena, &.{ staging, "bin" });
         try cwd.createDirPath(io, bin);
@@ -187,8 +187,6 @@ test "semantic versions are correctly ordered" {
     try std.testing.expect(lessVersion({}, "0.17.0-dev.1024", "0.17.0"));
 }
 
-const index_url = "https://ziglang.org/download/index.json";
-
 fn latestStable(index: std.json.Value) ?[]const u8 {
     var best: ?[]const u8 = null;
     var best_ver: ?std.SemanticVersion = null;
@@ -218,18 +216,35 @@ fn download(io: Io, client: *std.http.Client, url: []const u8, path: []const u8)
     if (res.status != .ok) return error.HttpStatus;
 }
 
-fn extract(io: Io, archive: []const u8, dir: []const u8) !void {
+/// Extract compressed tar archive to directory.
+///
+/// If `strip_components` is nonzero, the leading path components will be stripped.
+fn extract(io: Io, archive: []const u8, dir: []const u8, opts: struct { strip_components: u32 = 0 }) !void {
+    var flag_buf: [32]u8 = undefined;
+    var argv: [6][]const u8 = undefined;
+    argv[0..5].* = .{ "tar", "-xf", archive, "-C", dir };
+    var n: usize = 5;
+    if (opts.strip_components != 0) {
+        argv[n] = try std.mem.print(&flag_buf, "--strip-components={d}", .{opts.strip_components});
+        n += 1;
+    }
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "tar", "-xf", archive, "-C", dir, "--strip-components=1" },
+        .argv = argv[0..n],
         .stdin = .ignore,
     });
     const term = try child.wait(io);
     if (!term.success()) return error.TarFailed;
 }
 
+test "extract" {
+    const io = std.testing.io;
+    try extract(io, "./test.tar.xz", "/tmp/out-strip", .{ .strip_components = 1 });
+    try extract(io, "./test.tar.xz", "/tmp/out", .{});
+}
+
 fn downloadZls(io: Io, out: *Io.Writer, client: *std.http.Client, arena: std.mem.Allocator, version: []const u8, dir: []const u8) !void {
     var url: std.Io.Writer.Allocating = .init(arena);
-    try url.writer.print("https://releases.zigtools.org/v1/zls/select-version?zig_version={f}&compatibility=only-runtime", .{
+    try url.writer.print(zls_index_url, .{
         std.fmt.alt(std.Uri.Component{ .raw = version }, .formatEscaped),
     });
 
@@ -246,11 +261,6 @@ fn downloadZls(io: Io, out: *Io.Writer, client: *std.http.Client, arena: std.mem
         try out.print("error: {s}\n", .{msg.string});
         return error.ZlsUnsupported;
     }
-
-    const platform = try std.fmt.allocPrint(arena, "{s}-{s}", .{
-        @tagName(@import("builtin").cpu.arch),
-        @tagName(@import("builtin").os.tag),
-    });
 
     const zls_version = (index.object.get("version") orelse return error.UnknownVersion).string;
     const date = (index.object.get("date") orelse return error.BadRelease).string;
