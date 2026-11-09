@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const Command = enum { list, use, install, help };
+    const Command = enum { help, list, install, use, rm };
 
     const cmd = std.meta.stringToEnum(Command, args[1]) orelse fail(out, "unknown command");
     switch (cmd) {
@@ -35,6 +35,10 @@ pub fn main(init: std.process.Init) !void {
         .use => {
             if (args.len < 3) fail(out, "missing version");
             try use(io, out, init.environ_map, arena, args[2]);
+        },
+        .rm => {
+            if (args.len < 3) fail(out, "missing version");
+            try rm(io, out, init.environ_map, arena, args[2]);
         },
     }
 }
@@ -118,13 +122,10 @@ const Meta = struct {
 };
 
 fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, gpa: std.mem.Allocator, want: []const u8) !void {
-    // 1. Get Zig release metadata (want is either master, stable, or a version number)
-    // 2. Get Zls release metadata
-    // 3. Download and unzip zig
-    // 4. Download and unzip zls
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
+    // Fetch zig metadata
     const index = try fetch(&client, arena, zig_index_url);
     const requested_version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
     const meta: Meta = try .fromZigIndex(index, requested_version);
@@ -139,7 +140,6 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
 
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, root);
-
     if (cwd.access(io, dest, .{})) |_| {
         try out.print("already installed {s}\n", .{meta.version});
         return;
@@ -156,6 +156,7 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     const zls_index = try fetch(&client, arena, url.written());
     if (zls_index.object.get("message")) |msg| {
         try out.print("error: {s}\n", .{msg.string});
+        try out.flush();
         return error.ZlsUnsupported;
     }
     const zls_meta: Meta = try .fromZlsIndex(zls_index);
@@ -214,6 +215,25 @@ fn use(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Al
     try out.flush();
 }
 
+fn rm(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
+    const home = env.get("HOME") orelse return error.HomeNotSet;
+    const dest = try std.fs.path.join(arena, &.{ home, ".zig/zup", want });
+    const target_path = try std.fs.path.join(arena, &.{ dest, "bin" });
+    const sym_link_path = try std.fs.path.join(arena, &.{ home, ".zig/bin" });
+
+    const cwd = std.Io.Dir.cwd();
+    const target = cwd.statFile(io, target_path, .{}) catch fail(out, "version is not installed");
+
+    if (cwd.statFile(io, sym_link_path, .{})) |active| {
+        if (active.inode == target.inode) try cwd.deleteFile(io, sym_link_path);
+    } else |_| {}
+
+    try cwd.deleteTree(io, dest);
+
+    try out.print("removed {s}\n", .{want});
+    try out.flush();
+}
+
 fn usage(out: *Io.Writer) !void {
     try out.writeAll(
         \\Usage: zup [command]
@@ -222,6 +242,7 @@ fn usage(out: *Io.Writer) !void {
         \\
         \\  install <version>    install zig/zls
         \\  use <version>        use specified zig/zls version
+        \\  rm <version>         remove specified zig/zls version
         \\  list                 list all available versions
         \\  help                 display this help text
         \\
