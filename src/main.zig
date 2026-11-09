@@ -64,7 +64,63 @@ fn list(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.A
     for (names.items) |name| try out.print("{s}\n", .{name});
 }
 
+const Meta = struct {
+    name: []const u8,
+    version: []const u8,
+    date: []const u8,
+    url: []const u8,
+    size: u32,
+
+    fn fromZigIndex(index: std.json.Value, requested_version: []const u8) !Meta {
+        const release = index.object.get(requested_version) orelse return error.UnknownVersion;
+        // Some old releases have no version field
+        const version = if (release.object.get("version")) |v| v.string else requested_version;
+        const date = (release.object.get("date") orelse return error.BadRelease).string;
+        const asset = release.object.get(platform) orelse return error.UnsupportedPlatform;
+        const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
+        const size = (asset.object.get("size") orelse return error.BadIndex).string;
+        return .{
+            .name = "zig",
+            .version = version,
+            .date = date,
+            .url = url,
+            .size = try std.fmt.parseInt(u32, size, 10),
+        };
+    }
+
+    fn fromZlsIndex(index: std.json.Value) !Meta {
+        const version = (index.object.get("version") orelse return error.UnknownVersion).string;
+        const date = (index.object.get("date") orelse return error.BadRelease).string;
+        const asset = index.object.get(platform) orelse return error.UnsupportedPlatform;
+        const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
+        const size = (asset.object.get("size") orelse return error.BadIndex).string;
+        return .{
+            .name = "zls",
+            .version = version,
+            .date = date,
+            .url = url,
+            .size = try std.fmt.parseInt(u32, size, 10),
+        };
+    }
+
+    fn print(self: Meta, w: *Io.Writer) !void {
+        try w.print(
+            \\{s} {s} 
+            \\  {Bi:.0}
+            \\  {s}
+            \\  {s}
+            \\
+        , .{
+            self.name, self.version, self.size, self.date, self.url,
+        });
+    }
+};
+
 fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, gpa: std.mem.Allocator, want: []const u8) !void {
+    // 1. Get Zig release metadata (want is either master, stable, or a version number)
+    // 2. Get Zls release metadata
+    // 3. Download and unzip zig
+    // 4. Download and unzip zls
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
@@ -78,28 +134,15 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     const index = (try std.json.parseFromSlice(std.json.Value, arena, body.written(), .{})).value;
     const requested_version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
 
-    const release = index.object.get(requested_version) orelse return error.UnknownVersion;
-    // Some old releases have no version field
-    const version = if (release.object.get("version")) |v| v.string else requested_version;
-    const date = (release.object.get("date") orelse return error.BadRelease).string;
-    const asset = release.object.get(platform) orelse return error.UnsupportedPlatform;
-    const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
-    const size = (asset.object.get("size") orelse return error.BadIndex).string;
-
-    try out.print("version {s}\nplatform {s}\ndate {s}\ntarball {s}\nsize {Bi:.0}\n", .{
-        version,
-        platform,
-        date,
-        url,
-        try std.fmt.parseInt(u32, size, 10),
-    });
+    const meta: Meta = try .fromZigIndex(index, requested_version);
+    try meta.print(out);
     try out.flush();
 
     const home = env.get("HOME") orelse return error.HomeNotSet;
     const root = try std.fs.path.join(arena, &.{ home, ".zig/zup" });
-    const dest = try std.fs.path.join(arena, &.{ root, version });
-    const staging = try std.fmt.allocPrint(arena, "{s}/{s}.installing", .{ root, version });
-    const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ root, version });
+    const dest = try std.fs.path.join(arena, &.{ root, meta.version });
+    const staging = try std.fmt.allocPrint(arena, "{s}/{s}.installing", .{ root, meta.version });
+    const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ root, meta.version });
 
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, root);
@@ -109,10 +152,10 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
         try cwd.createDirPath(io, staging);
         errdefer cwd.deleteTree(io, staging) catch {};
 
-        try out.print("downloading {s}\n", .{url});
+        try out.print("downloading {s}\n", .{meta.url});
         try out.flush();
         errdefer cwd.deleteFile(io, archive) catch {};
-        try download(io, &client, url, archive);
+        try download(io, &client, meta.url, archive);
         try out.print("extracting\n", .{});
         try out.flush();
         try extract(io, archive, staging, .{ .strip_components = 1 });
@@ -123,12 +166,12 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
         const zig_dst = try std.fs.path.join(arena, &.{ bin, "zig" });
         try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
 
-        try downloadZls(io, out, &client, arena, version, bin);
+        try downloadZls(io, out, &client, arena, meta.version, bin);
 
         try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
         cwd.deleteFile(io, archive) catch {};
 
-        if (!std.mem.eql(u8, version, requested_version)) {
+        if (!std.mem.eql(u8, meta.version, requested_version)) {
             const alias = try std.fs.path.join(arena, &.{ root, requested_version });
             cwd.deleteFile(io, alias) catch {};
             try cwd.symLinkAtomic(io, dest, alias, .{ .is_directory = true });
@@ -136,7 +179,7 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
 
         return;
     };
-    try out.print("already installed {s}\n", .{version});
+    try out.print("already installed {s}\n", .{meta.version});
 }
 
 fn use(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
@@ -262,18 +305,8 @@ fn downloadZls(io: Io, out: *Io.Writer, client: *std.http.Client, arena: std.mem
         return error.ZlsUnsupported;
     }
 
-    const zls_version = (index.object.get("version") orelse return error.UnknownVersion).string;
-    const date = (index.object.get("date") orelse return error.BadRelease).string;
-    const asset = index.object.get(platform) orelse return error.UnsupportedPlatform;
-    const zls_url = (asset.object.get("tarball") orelse return error.BadIndex).string;
-    const zls_size = (asset.object.get("size") orelse return error.BadIndex).string;
-
-    try out.print("zls version {s}\ndate {s}\ntarball {s}\nsize {s}\n", .{
-        zls_version,
-        date,
-        zls_url,
-        zls_size,
-    });
+    const meta: Meta = try .fromZlsIndex(index);
+    try meta.print(out);
     try out.flush();
 
     const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ dir, version });
@@ -282,7 +315,7 @@ fn downloadZls(io: Io, out: *Io.Writer, client: *std.http.Client, arena: std.mem
     var buf: [64 * 1024]u8 = undefined;
     var fw: Io.File.Writer = .init(file, io, &buf);
     const archive_res = try client.fetch(.{
-        .location = .{ .url = zls_url },
+        .location = .{ .url = meta.url },
         .response_writer = &fw.interface,
     });
     try fw.interface.flush();
