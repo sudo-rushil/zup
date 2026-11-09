@@ -127,24 +127,8 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
 
     const index = try fetch(&client, arena, zig_index_url);
     const requested_version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
-
     const meta: Meta = try .fromZigIndex(index, requested_version);
     try meta.print(out);
-    try out.flush();
-
-    // Fetch zls metadata
-    var url: std.Io.Writer.Allocating = .init(arena);
-    try url.writer.print(zls_index_url, .{
-        std.fmt.alt(std.Uri.Component{ .raw = meta.version }, .formatEscaped),
-    });
-    const zls_index = try fetch(&client, arena, url.written());
-    if (zls_index.object.get("message")) |msg| {
-        try out.print("error: {s}\n", .{msg.string});
-        return error.ZlsUnsupported;
-    }
-
-    const zls_meta: Meta = try .fromZlsIndex(zls_index);
-    try zls_meta.print(out);
     try out.flush();
 
     const home = env.get("HOME") orelse return error.HomeNotSet;
@@ -156,47 +140,65 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, root);
 
-    cwd.access(io, dest, .{}) catch {
-        cwd.deleteTree(io, staging) catch {};
-        try cwd.createDirPath(io, staging);
-        errdefer cwd.deleteTree(io, staging) catch {};
-
-        try out.print("downloading {s}\n", .{meta.url});
-        try out.flush();
-        errdefer cwd.deleteFile(io, archive) catch {};
-        try download(io, &client, meta.url, archive);
-        try out.print("extracting\n", .{});
-        try out.flush();
-        try extract(io, archive, staging, .{ .strip_components = 1 });
-
-        const bin = try std.fs.path.join(arena, &.{ staging, "bin" });
-        try cwd.createDirPath(io, bin);
-        const zig_src = try std.fs.path.join(arena, &.{ staging, "zig" });
-        const zig_dst = try std.fs.path.join(arena, &.{ bin, "zig" });
-        try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
-
-        const zls_archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ bin, meta.version });
-        try out.print("downloading {s}\n", .{zls_meta.url});
-        try out.flush();
-        errdefer cwd.deleteFile(io, zls_archive) catch {};
-        try download(io, &client, zls_meta.url, zls_archive);
-        try out.print("extracting\n", .{});
-        try out.flush();
-        try extract(io, zls_archive, bin, .{});
-        cwd.deleteFile(io, zls_archive) catch {};
-
-        try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
-        cwd.deleteFile(io, archive) catch {};
-
-        if (!std.mem.eql(u8, meta.version, requested_version)) {
-            const alias = try std.fs.path.join(arena, &.{ root, requested_version });
-            cwd.deleteFile(io, alias) catch {};
-            try cwd.symLinkAtomic(io, dest, alias, .{ .is_directory = true });
-        }
-
+    if (cwd.access(io, dest, .{})) |_| {
+        try out.print("already installed {s}\n", .{meta.version});
         return;
-    };
-    try out.print("already installed {s}\n", .{meta.version});
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    // Fetch zls metadata
+    var url: std.Io.Writer.Allocating = .init(arena);
+    try url.writer.print(zls_index_url, .{
+        std.fmt.alt(std.Uri.Component{ .raw = meta.version }, .formatEscaped),
+    });
+    const zls_index = try fetch(&client, arena, url.written());
+    if (zls_index.object.get("message")) |msg| {
+        try out.print("error: {s}\n", .{msg.string});
+        return error.ZlsUnsupported;
+    }
+    const zls_meta: Meta = try .fromZlsIndex(zls_index);
+    try zls_meta.print(out);
+    try out.flush();
+
+    // Download and extract
+    cwd.deleteTree(io, staging) catch {};
+    try cwd.createDirPath(io, staging);
+    errdefer cwd.deleteTree(io, staging) catch {};
+
+    try out.print("downloading {s}\n", .{meta.url});
+    try out.flush();
+    errdefer cwd.deleteFile(io, archive) catch {};
+    try download(io, &client, meta.url, archive);
+    try out.print("extracting\n", .{});
+    try out.flush();
+    try extract(io, archive, staging, .{ .strip_components = 1 });
+
+    const bin = try std.fs.path.join(arena, &.{ staging, "bin" });
+    try cwd.createDirPath(io, bin);
+    const zig_src = try std.fs.path.join(arena, &.{ staging, "zig" });
+    const zig_dst = try std.fs.path.join(arena, &.{ bin, "zig" });
+    try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
+
+    const zls_archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ bin, meta.version });
+    try out.print("downloading {s}\n", .{zls_meta.url});
+    try out.flush();
+    errdefer cwd.deleteFile(io, zls_archive) catch {};
+    try download(io, &client, zls_meta.url, zls_archive);
+    try out.print("extracting\n", .{});
+    try out.flush();
+    try extract(io, zls_archive, bin, .{});
+    cwd.deleteFile(io, zls_archive) catch {};
+
+    try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
+    cwd.deleteFile(io, archive) catch {};
+
+    if (!std.mem.eql(u8, meta.version, requested_version)) {
+        const alias = try std.fs.path.join(arena, &.{ root, requested_version });
+        cwd.deleteFile(io, alias) catch {};
+        try cwd.symLinkAtomic(io, dest, alias, .{ .is_directory = true });
+    }
 }
 
 fn use(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
