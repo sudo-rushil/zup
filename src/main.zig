@@ -138,6 +138,29 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     try meta.print(out);
     try out.flush();
 
+    // Fetch zls metadata
+    var url: std.Io.Writer.Allocating = .init(arena);
+    try url.writer.print(zls_index_url, .{
+        std.fmt.alt(std.Uri.Component{ .raw = meta.version }, .formatEscaped),
+    });
+
+    var zls_body: std.Io.Writer.Allocating = .init(arena);
+    const zls_res = try client.fetch(.{
+        .location = .{ .url = url.written() },
+        .response_writer = &zls_body.writer,
+    });
+    if (zls_res.status != .ok) return error.HttpStatus;
+
+    const zls_index = (try std.json.parseFromSlice(std.json.Value, arena, zls_body.written(), .{})).value;
+
+    if (zls_index.object.get("message")) |msg| {
+        try out.print("error: {s}\n", .{msg.string});
+        return error.ZlsUnsupported;
+    }
+    const zls_meta: Meta = try .fromZlsIndex(zls_index);
+    try zls_meta.print(out);
+    try out.flush();
+
     const home = env.get("HOME") orelse return error.HomeNotSet;
     const root = try std.fs.path.join(arena, &.{ home, ".zig/zup" });
     const dest = try std.fs.path.join(arena, &.{ root, meta.version });
@@ -166,7 +189,15 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
         const zig_dst = try std.fs.path.join(arena, &.{ bin, "zig" });
         try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
 
-        try downloadZls(io, out, &client, arena, meta.version, bin);
+        const zls_archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ bin, meta.version });
+        errdefer cwd.deleteFile(io, zls_archive) catch {};
+        try out.print("downloading {s}\n", .{zls_meta.url});
+        try out.flush();
+        try download(io, &client, zls_meta.url, zls_archive);
+        try out.print("extracting\n", .{});
+        try out.flush();
+        try extract(io, zls_archive, bin, .{});
+        cwd.deleteFile(io, zls_archive) catch {};
 
         try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
         cwd.deleteFile(io, archive) catch {};
@@ -277,56 +308,4 @@ fn extract(io: Io, archive: []const u8, dir: []const u8, opts: struct { strip_co
     });
     const term = try child.wait(io);
     if (!term.success()) return error.TarFailed;
-}
-
-test "extract" {
-    const io = std.testing.io;
-    try extract(io, "./test.tar.xz", "/tmp/out-strip", .{ .strip_components = 1 });
-    try extract(io, "./test.tar.xz", "/tmp/out", .{});
-}
-
-fn downloadZls(io: Io, out: *Io.Writer, client: *std.http.Client, arena: std.mem.Allocator, version: []const u8, dir: []const u8) !void {
-    var url: std.Io.Writer.Allocating = .init(arena);
-    try url.writer.print(zls_index_url, .{
-        std.fmt.alt(std.Uri.Component{ .raw = version }, .formatEscaped),
-    });
-
-    var body: std.Io.Writer.Allocating = .init(arena);
-    const res = try client.fetch(.{
-        .location = .{ .url = url.written() },
-        .response_writer = &body.writer,
-    });
-    if (res.status != .ok) return error.HttpStatus;
-
-    const index = (try std.json.parseFromSlice(std.json.Value, arena, body.written(), .{})).value;
-
-    if (index.object.get("message")) |msg| {
-        try out.print("error: {s}\n", .{msg.string});
-        return error.ZlsUnsupported;
-    }
-
-    const meta: Meta = try .fromZlsIndex(index);
-    try meta.print(out);
-    try out.flush();
-
-    const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ dir, version });
-    var file = try std.Io.Dir.cwd().createFile(io, archive, .{});
-
-    var buf: [64 * 1024]u8 = undefined;
-    var fw: Io.File.Writer = .init(file, io, &buf);
-    const archive_res = try client.fetch(.{
-        .location = .{ .url = meta.url },
-        .response_writer = &fw.interface,
-    });
-    try fw.interface.flush();
-    if (archive_res.status != .ok) return error.HttpStatus;
-    file.close(io);
-
-    var child = try std.process.spawn(io, .{ .argv = &.{ "tar", "-xf", archive, "-C", dir }, .stdin = .ignore });
-    const term = try child.wait(io);
-    if (!term.success()) return error.TarFailed;
-
-    std.Io.Dir.cwd().deleteFile(io, archive) catch {};
-
-    return;
 }
