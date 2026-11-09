@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const builtin = @import("builtin");
+const Value = std.json.Value;
 
 const platform = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag);
 const zig_index_url = "https://ziglang.org/download/index.json";
@@ -71,7 +72,7 @@ const Meta = struct {
     url: []const u8,
     size: u32,
 
-    fn fromZigIndex(index: std.json.Value, requested_version: []const u8) !Meta {
+    fn fromZigIndex(index: Value, requested_version: []const u8) !Meta {
         const release = index.object.get(requested_version) orelse return error.UnknownVersion;
         // Some old releases have no version field
         const version = if (release.object.get("version")) |v| v.string else requested_version;
@@ -88,7 +89,7 @@ const Meta = struct {
         };
     }
 
-    fn fromZlsIndex(index: std.json.Value) !Meta {
+    fn fromZlsIndex(index: Value) !Meta {
         const version = (index.object.get("version") orelse return error.UnknownVersion).string;
         const date = (index.object.get("date") orelse return error.BadRelease).string;
         const asset = index.object.get(platform) orelse return error.UnsupportedPlatform;
@@ -124,14 +125,7 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    var body: std.Io.Writer.Allocating = .init(arena);
-    const res = try client.fetch(.{
-        .location = .{ .url = zig_index_url },
-        .response_writer = &body.writer,
-    });
-    if (res.status != .ok) return error.HttpStatus;
-
-    const index = (try std.json.parseFromSlice(std.json.Value, arena, body.written(), .{})).value;
+    const index = try fetch(&client, arena, zig_index_url);
     const requested_version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
 
     const meta: Meta = try .fromZigIndex(index, requested_version);
@@ -143,20 +137,12 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     try url.writer.print(zls_index_url, .{
         std.fmt.alt(std.Uri.Component{ .raw = meta.version }, .formatEscaped),
     });
-
-    var zls_body: std.Io.Writer.Allocating = .init(arena);
-    const zls_res = try client.fetch(.{
-        .location = .{ .url = url.written() },
-        .response_writer = &zls_body.writer,
-    });
-    if (zls_res.status != .ok) return error.HttpStatus;
-
-    const zls_index = (try std.json.parseFromSlice(std.json.Value, arena, zls_body.written(), .{})).value;
-
+    const zls_index = try fetch(&client, arena, url.written());
     if (zls_index.object.get("message")) |msg| {
         try out.print("error: {s}\n", .{msg.string});
         return error.ZlsUnsupported;
     }
+
     const zls_meta: Meta = try .fromZlsIndex(zls_index);
     try zls_meta.print(out);
     try out.flush();
@@ -190,9 +176,9 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
         try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
 
         const zls_archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ bin, meta.version });
-        errdefer cwd.deleteFile(io, zls_archive) catch {};
         try out.print("downloading {s}\n", .{zls_meta.url});
         try out.flush();
+        errdefer cwd.deleteFile(io, zls_archive) catch {};
         try download(io, &client, zls_meta.url, zls_archive);
         try out.print("extracting\n", .{});
         try out.flush();
@@ -261,7 +247,7 @@ test "semantic versions are correctly ordered" {
     try std.testing.expect(lessVersion({}, "0.17.0-dev.1024", "0.17.0"));
 }
 
-fn latestStable(index: std.json.Value) ?[]const u8 {
+fn latestStable(index: Value) ?[]const u8 {
     var best: ?[]const u8 = null;
     var best_ver: ?std.SemanticVersion = null;
     var it = index.object.iterator();
@@ -274,6 +260,22 @@ fn latestStable(index: std.json.Value) ?[]const u8 {
         }
     }
     return best;
+}
+
+/// Fetch untyped JSON from URL
+fn fetch(
+    client: *std.http.Client,
+    arena: std.mem.Allocator,
+    url: []const u8,
+) !Value {
+    var body: std.Io.Writer.Allocating = .init(arena);
+    const res = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &body.writer,
+    });
+    if (res.status != .ok) return error.HttpStatus;
+    const response = try std.json.parseFromSlice(Value, arena, body.written(), .{});
+    return response.value;
 }
 
 fn download(io: Io, client: *std.http.Client, url: []const u8, path: []const u8) !void {
