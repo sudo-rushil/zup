@@ -45,9 +45,9 @@ pub fn main(init: std.process.Init) !void {
 
 fn list(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator) !void {
     const home = env.get("HOME") orelse return error.HomeNotSet;
-    const path = try std.fs.path.join(arena, &.{ home, ".zig/zup" });
+    const paths: Paths = try .init(home, arena);
 
-    var dir = std.Io.Dir.openDir(.cwd(), io, path, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDir(.cwd(), io, paths.zup_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             try out.print("no installs yet\n", .{});
             return;
@@ -121,6 +121,38 @@ const Meta = struct {
     }
 };
 
+test "meta size" {
+    try std.testing.expectEqual(72, @sizeOf(Meta));
+    try std.testing.expectEqual(8, @alignOf(Meta));
+}
+
+const Paths = struct {
+    arena: std.mem.Allocator,
+    /// zup root directory, typically ~/.zig/zup/
+    zup_root: []const u8,
+    /// symlink target added to path, typically ~/.zig/bin/
+    zig_bin: []const u8,
+
+    fn init(home: []const u8, arena: std.mem.Allocator) !Paths {
+        const zup_root = try std.fs.path.join(arena, &.{ home, ".zig/zup" });
+        const zig_bin = try std.fs.path.join(arena, &.{ home, ".zig/bin" });
+        return .{
+            .arena = arena,
+            .zup_root = zup_root,
+            .zig_bin = zig_bin,
+        };
+    }
+};
+
+test "paths initialize" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const paths: Paths = try .init("/home", arena.allocator());
+
+    try std.testing.expectEqualStrings("/home/.zig/zup", paths.zup_root);
+    try std.testing.expectEqualStrings("/home/.zig/bin", paths.zig_bin);
+}
+
 fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, gpa: std.mem.Allocator, want: []const u8) !void {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -133,7 +165,8 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
     try out.flush();
 
     const home = env.get("HOME") orelse return error.HomeNotSet;
-    const root = try std.fs.path.join(arena, &.{ home, ".zig/zup" });
+    const paths: Paths = try .init(home, arena);
+    const root = paths.zup_root;
     const dest = try std.fs.path.join(arena, &.{ root, meta.version });
     const staging = try std.fmt.allocPrint(arena, "{s}/{s}.installing", .{ root, meta.version });
     const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ root, meta.version });
@@ -204,12 +237,12 @@ fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.me
 
 fn use(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
     const home = env.get("HOME") orelse return error.HomeNotSet;
-    const sym_link_path = try std.fs.path.join(arena, &.{ home, ".zig/bin" });
-    const target_path = try std.fs.path.join(arena, &.{ home, ".zig/zup", want, "bin" });
+    const paths: Paths = try .init(home, arena);
+    const target_path = try std.fs.path.join(arena, &.{ paths.zup_root, want, "bin" });
 
     const cwd = std.Io.Dir.cwd();
     cwd.access(io, target_path, .{}) catch fail(out, "version missing");
-    try cwd.symLinkAtomic(io, target_path, sym_link_path, .{ .is_directory = true });
+    try cwd.symLinkAtomic(io, target_path, paths.zig_bin, .{ .is_directory = true });
 
     try out.print("version {s} is now active\n", .{want});
     try out.flush();
@@ -217,7 +250,8 @@ fn use(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Al
 
 fn rm(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
     const home = env.get("HOME") orelse return error.HomeNotSet;
-    const dest = try std.fs.path.join(arena, &.{ home, ".zig/zup", want });
+    const paths: Paths = try .init(home, arena);
+    const dest = try std.fs.path.join(arena, &.{ paths.zup_root, want });
     const target_path = try std.fs.path.join(arena, &.{ dest, "bin" });
     const sym_link_path = try std.fs.path.join(arena, &.{ home, ".zig/bin" });
 
