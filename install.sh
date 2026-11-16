@@ -38,7 +38,7 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+
   exit 1
 fi
 
-base_url="https://github.com/$repo/releases/download/v$version"
+base_url="https://github.com/$repo/releases/download/$version"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 
