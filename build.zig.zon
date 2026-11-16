@@ -1,8 +1,8 @@
 .{
     .name = .zup,
-    .version = "0.0.0",
+    .version = "0.0.1",
     .fingerprint = 0xa46ac81b755b4df8, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{
         "build.zig",
