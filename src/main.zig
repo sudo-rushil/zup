@@ -22,29 +22,25 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const Command = enum { help, list, install, use, rm };
+    const Command = enum { help, list, use, rm };
 
     const cmd = std.meta.stringToEnum(Command, args[1]) orelse fail(out, "unknown command");
+    const home = init.environ_map.get("HOME") orelse return error.HomeNotSet;
     switch (cmd) {
         .help => try usage(out),
-        .list => try list(io, out, init.environ_map, arena),
-        .install => {
-            if (args.len < 3) fail(out, "missing version");
-            try install(io, out, init.environ_map, arena, init.gpa, args[2]);
-        },
+        .list => try list(io, out, arena, home),
         .use => {
             if (args.len < 3) fail(out, "missing version");
-            try use(io, out, init.environ_map, arena, args[2]);
+            try use(io, out, arena, init.gpa, home, args[2]);
         },
         .rm => {
             if (args.len < 3) fail(out, "missing version");
-            try rm(io, out, init.environ_map, arena, args[2]);
+            try rm(io, out, arena, home, args[2]);
         },
     }
 }
 
-fn list(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator) !void {
-    const home = env.get("HOME") orelse return error.HomeNotSet;
+fn list(io: Io, out: *Io.Writer, arena: std.mem.Allocator, home: []const u8) !void {
     const paths: Paths = try .init(home, arena);
 
     var dir = std.Io.Dir.openDir(.cwd(), io, paths.zup_root, .{ .iterate = true }) catch |err| switch (err) {
@@ -66,17 +62,24 @@ fn list(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.A
 
     std.mem.sort([]const u8, names.items, {}, lessVersion);
 
+    if (names.items.len == 0) {
+        try out.print("no installs yet\n", .{});
+    }
+
     for (names.items) |name| try out.print("{s}\n", .{name});
 }
 
-const Meta = struct {
-    name: []const u8,
+const Tool = enum { zig, zls };
+
+const ToolMetadata = struct {
+    tool: Tool,
+    /// Tool version (for .zls this is zls's version; do not build paths from it)
     version: []const u8,
     date: []const u8,
     url: []const u8,
     size: u32,
 
-    fn fromZigIndex(index: Value, requested_version: []const u8) !Meta {
+    fn fromZigIndex(index: Value, requested_version: []const u8) !ToolMetadata {
         const release = index.object.get(requested_version) orelse return error.UnknownVersion;
         // Some old releases have no version field
         const version = if (release.object.get("version")) |v| v.string else requested_version;
@@ -85,7 +88,7 @@ const Meta = struct {
         const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
         const size = (asset.object.get("size") orelse return error.BadIndex).string;
         return .{
-            .name = "zig",
+            .tool = .zig,
             .version = version,
             .date = date,
             .url = url,
@@ -93,14 +96,14 @@ const Meta = struct {
         };
     }
 
-    fn fromZlsIndex(index: Value) !Meta {
+    fn fromZlsIndex(index: Value) !ToolMetadata {
         const version = (index.object.get("version") orelse return error.UnknownVersion).string;
         const date = (index.object.get("date") orelse return error.BadRelease).string;
         const asset = index.object.get(platform) orelse return error.UnsupportedPlatform;
         const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
         const size = (asset.object.get("size") orelse return error.BadIndex).string;
         return .{
-            .name = "zls",
+            .tool = .zls,
             .version = version,
             .date = date,
             .url = url,
@@ -108,7 +111,7 @@ const Meta = struct {
         };
     }
 
-    fn print(self: Meta, w: *Io.Writer) !void {
+    fn print(self: ToolMetadata, w: *Io.Writer) !void {
         try w.print(
             \\{s} {s} 
             \\  {Bi:.0}
@@ -116,31 +119,53 @@ const Meta = struct {
             \\  {s}
             \\
         , .{
-            self.name, self.version, self.size, self.date, self.url,
+            @tagName(self.tool), self.version, self.size, self.date, self.url,
         });
     }
 };
 
-test "meta size" {
-    try std.testing.expectEqual(72, @sizeOf(Meta));
-    try std.testing.expectEqual(8, @alignOf(Meta));
+test "tool metadata size" {
+    try std.testing.expectEqual(56, @sizeOf(ToolMetadata));
+    try std.testing.expectEqual(8, @alignOf(ToolMetadata));
 }
 
 const Paths = struct {
     arena: std.mem.Allocator,
     /// zup root directory, typically ~/.zig/zup/
     zup_root: []const u8,
-    /// symlink target added to path, typically ~/.zig/bin/
-    zig_bin: []const u8,
+    /// bin directory added to path, typically ~/.zig/bin/
+    bin_dir: []const u8,
 
     fn init(home: []const u8, arena: std.mem.Allocator) !Paths {
-        const zup_root = try std.fs.path.join(arena, &.{ home, ".zig/zup" });
-        const zig_bin = try std.fs.path.join(arena, &.{ home, ".zig/bin" });
         return .{
             .arena = arena,
-            .zup_root = zup_root,
-            .zig_bin = zig_bin,
+            .zup_root = try std.fs.path.join(arena, &.{ home, ".zig/zup" }),
+            .bin_dir = try std.fs.path.join(arena, &.{ home, ".zig/bin" }),
         };
+    }
+
+    fn versionDir(paths: *const Paths, version: []const u8) ![]const u8 {
+        return std.fs.path.join(paths.arena, &.{ paths.zup_root, version });
+    }
+
+    fn toolDir(paths: *const Paths, version: []const u8, tool: Tool) ![]const u8 {
+        return std.fs.path.join(paths.arena, &.{ paths.zup_root, version, @tagName(tool) });
+    }
+
+    fn exe(paths: *const Paths, version: []const u8, tool: Tool) ![]const u8 {
+        return std.fs.path.join(paths.arena, &.{ paths.zup_root, version, @tagName(tool), @tagName(tool) });
+    }
+
+    fn staging(paths: *const Paths, version: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(paths.arena, "{s}/{s}.installing", .{ paths.zup_root, version });
+    }
+
+    fn stageDir(paths: *const Paths, version: []const u8, tool: Tool) ![]const u8 {
+        return std.fmt.allocPrint(paths.arena, "{s}/{s}.installing/{s}", .{ paths.zup_root, version, @tagName(tool) });
+    }
+
+    fn link(paths: *const Paths, tool: Tool) ![]const u8 {
+        return std.fs.path.join(paths.arena, &.{ paths.bin_dir, @tagName(tool) });
     }
 };
 
@@ -148,121 +173,126 @@ test "paths initialize" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const paths: Paths = try .init("/home", arena.allocator());
+    const version = "0.17.1";
 
     try std.testing.expectEqualStrings("/home/.zig/zup", paths.zup_root);
-    try std.testing.expectEqualStrings("/home/.zig/bin", paths.zig_bin);
+    try std.testing.expectEqualStrings("/home/.zig/bin", paths.bin_dir);
+    try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1", try paths.versionDir(version));
+    try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1/zig", try paths.toolDir(version, .zig));
+    try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1/zls/zls", try paths.exe(version, .zls));
+    try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1.installing", try paths.staging(version));
+    try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1.installing/zig", try paths.stageDir(version, .zig));
+    try std.testing.expectEqualStrings("/home/.zig/bin/zig", try paths.link(.zig));
 }
 
-fn install(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, gpa: std.mem.Allocator, want: []const u8) !void {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
-    // Fetch zig metadata
-    const index = try fetch(&client, arena, zig_index_url);
-    const requested_version = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
-    const meta: Meta = try .fromZigIndex(index, requested_version);
-    try meta.print(out);
-    try out.flush();
-
-    const home = env.get("HOME") orelse return error.HomeNotSet;
-    const paths: Paths = try .init(home, arena);
-    const root = paths.zup_root;
-    const dest = try std.fs.path.join(arena, &.{ root, meta.version });
-    const staging = try std.fmt.allocPrint(arena, "{s}/{s}.installing", .{ root, meta.version });
-    const archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ root, meta.version });
-
+/// Ensure that zig and zls are downloaded and extracted to their tool directories
+///
+/// Cleans up staging directory and tarballs
+fn ensure(io: Io, client: *std.http.Client, arena: std.mem.Allocator, paths: *const Paths, zig: ToolMetadata, zls: ToolMetadata) !void {
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, root);
-    if (cwd.access(io, dest, .{})) |_| {
-        try out.print("already installed {s}\n", .{meta.version});
-        return;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
+    const version = zig.version;
 
-    // Fetch zls metadata
+    if (cwd.statFile(io, try paths.exe(version, .zig), .{})) |_| {
+        return;
+    } else |_| {}
+
+    const staging = try paths.staging(version);
+    cwd.deleteTree(io, staging) catch {};
+    try cwd.createDirPath(io, staging);
+    errdefer cwd.deleteTree(io, staging) catch {};
+
+    const dl = try std.fs.path.join(arena, &.{ staging, "dl" });
+    try cwd.createDirPath(io, dl);
+
+    const zig_archive = try std.fs.path.join(arena, &.{ dl, "zig.tar.xz" });
+    try download(io, client, zig.url, zig_archive);
+    const zig_stage = try paths.stageDir(version, .zig);
+    try cwd.createDirPath(io, zig_stage);
+    try extract(io, zig_archive, zig_stage, .{ .strip_components = 1 });
+
+    const zls_archive = try std.fs.path.join(arena, &.{ dl, "zls.tar.xz" });
+    try download(io, client, zls.url, zls_archive);
+    const zls_stage = try paths.stageDir(version, .zls);
+    try cwd.createDirPath(io, zls_stage);
+    try extract(io, zls_archive, zls_stage, .{});
+
+    try cwd.deleteTree(io, dl);
+    try std.Io.Dir.rename(cwd, staging, cwd, try paths.versionDir(version), io);
+}
+
+/// Resolves zls metadata corresponding to desired zig version
+fn resolveZls(out: *Io.Writer, client: *std.http.Client, arena: std.mem.Allocator, zig_version: []const u8) !ToolMetadata {
     var url: std.Io.Writer.Allocating = .init(arena);
     try url.writer.print(zls_index_url, .{
-        std.fmt.alt(std.Uri.Component{ .raw = meta.version }, .formatEscaped),
+        std.fmt.alt(std.Uri.Component{ .raw = zig_version }, .formatEscaped),
     });
-    const zls_index = try fetch(&client, arena, url.written());
+    const zls_index = try fetch(client, arena, url.written());
     if (zls_index.object.get("message")) |msg| {
         try out.print("error: {s}\n", .{msg.string});
         try out.flush();
         return error.ZlsUnsupported;
     }
-    const zls_meta: Meta = try .fromZlsIndex(zls_index);
+    return .fromZlsIndex(zls_index);
+}
+
+/// Use wanted version of zig and zls
+///
+/// Resolves and downloads if necessary; always resolves `master` and `stable`
+fn use(io: Io, out: *Io.Writer, arena: std.mem.Allocator, gpa: std.mem.Allocator, home: []const u8, want: []const u8) !void {
+    const paths: Paths = try .init(home, arena);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, paths.bin_dir);
+
+    if (cwd.statFile(io, try paths.exe(want, .zig), .{})) |_| {
+        try activate(io, out, &paths, want);
+        return;
+    } else |_| {}
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    const index = try fetch(&client, arena, zig_index_url);
+    const key = if (std.mem.eql(u8, want, "stable")) latestStable(index) orelse return error.NoStable else want;
+    const zig_meta: ToolMetadata = try .fromZigIndex(index, key);
+    const zls_meta: ToolMetadata = try resolveZls(out, &client, arena, zig_meta.version);
+
+    try zig_meta.print(out);
     try zls_meta.print(out);
     try out.flush();
 
-    // Download and extract
-    cwd.deleteTree(io, staging) catch {};
-    try cwd.createDirPath(io, staging);
-    errdefer cwd.deleteTree(io, staging) catch {};
+    try ensure(io, &client, arena, &paths, zig_meta, zls_meta);
+    try activate(io, out, &paths, zig_meta.version);
+}
 
-    try out.print("downloading {s}\n", .{meta.url});
-    try out.flush();
-    errdefer cwd.deleteFile(io, archive) catch {};
-    try download(io, &client, meta.url, archive);
-    try out.print("extracting\n", .{});
-    try out.flush();
-    try extract(io, archive, staging, .{ .strip_components = 1 });
-
-    const bin = try std.fs.path.join(arena, &.{ staging, "bin" });
-    try cwd.createDirPath(io, bin);
-    const zig_src = try std.fs.path.join(arena, &.{ staging, "zig" });
-    const zig_dst = try std.fs.path.join(arena, &.{ bin, "zig" });
-    try std.Io.Dir.rename(cwd, zig_src, cwd, zig_dst, io);
-
-    const zls_archive = try std.fmt.allocPrint(arena, "{s}/{s}.tar.xz", .{ bin, meta.version });
-    try out.print("downloading {s}\n", .{zls_meta.url});
-    try out.flush();
-    errdefer cwd.deleteFile(io, zls_archive) catch {};
-    try download(io, &client, zls_meta.url, zls_archive);
-    try out.print("extracting\n", .{});
-    try out.flush();
-    try extract(io, zls_archive, bin, .{});
-    cwd.deleteFile(io, zls_archive) catch {};
-
-    try std.Io.Dir.rename(cwd, staging, cwd, dest, io);
-    cwd.deleteFile(io, archive) catch {};
-
-    if (!std.mem.eql(u8, meta.version, requested_version)) {
-        const alias = try std.fs.path.join(arena, &.{ root, requested_version });
-        cwd.deleteFile(io, alias) catch {};
-        try cwd.symLinkAtomic(io, dest, alias, .{ .is_directory = true });
+/// Activate wanted verson of zig and zls by symlinking into $HOME/zig/bin
+///
+/// Fails if zls is missing
+fn activate(io: Io, out: *Io.Writer, paths: *const Paths, version: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    for (std.enums.values(Tool)) |tool| {
+        const target = try paths.exe(version, tool);
+        // This can only run if zls is missing
+        _ = cwd.statFile(io, target, .{}) catch fail(out, "zls is missing");
+        try cwd.symLinkAtomic(io, target, try paths.link(tool), .{});
     }
-}
-
-fn use(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
-    const home = env.get("HOME") orelse return error.HomeNotSet;
-    const paths: Paths = try .init(home, arena);
-    const target_path = try std.fs.path.join(arena, &.{ paths.zup_root, want, "bin" });
-
-    const cwd = std.Io.Dir.cwd();
-    cwd.access(io, target_path, .{}) catch fail(out, "version missing");
-    try cwd.symLinkAtomic(io, target_path, paths.zig_bin, .{ .is_directory = true });
-
-    try out.print("version {s} is now active\n", .{want});
+    try out.print("version {s} is active\n", .{version});
     try out.flush();
 }
 
-fn rm(io: Io, out: *Io.Writer, env: *std.process.Environ.Map, arena: std.mem.Allocator, want: []const u8) !void {
-    const home = env.get("HOME") orelse return error.HomeNotSet;
+/// Remove a concrete version
+fn rm(io: Io, out: *Io.Writer, arena: std.mem.Allocator, home: []const u8, want: []const u8) !void {
     const paths: Paths = try .init(home, arena);
-    const dest = try std.fs.path.join(arena, &.{ paths.zup_root, want });
-    const target_path = try std.fs.path.join(arena, &.{ dest, "bin" });
-    const sym_link_path = try std.fs.path.join(arena, &.{ home, ".zig/bin" });
-
     const cwd = std.Io.Dir.cwd();
-    const target = cwd.statFile(io, target_path, .{}) catch fail(out, "version is not installed");
+    _ = std.SemanticVersion.parse(want) catch fail(out, "not a version");
+    const dest = try paths.versionDir(want);
 
-    if (cwd.statFile(io, sym_link_path, .{})) |active| {
-        if (active.inode == target.inode) try cwd.deleteFile(io, sym_link_path);
-    } else |_| {}
-
+    _ = cwd.statFile(io, dest, .{}) catch fail(out, "version is not installed");
     try cwd.deleteTree(io, dest);
+
+    for (std.enums.values(Tool)) |tool| {
+        const link = try paths.link(tool);
+        if (cwd.statFile(io, link, .{})) |_| {} else |_| cwd.deleteFile(io, link) catch {};
+    }
 
     try out.print("removed {s}\n", .{want});
     try out.flush();
@@ -274,7 +304,6 @@ fn usage(out: *Io.Writer) !void {
         \\
         \\Commands:
         \\
-        \\  install <version>    install zig/zls
         \\  use <version>        use specified zig/zls version
         \\  rm <version>         remove specified zig/zls version
         \\  list                 list all available versions
@@ -335,6 +364,7 @@ fn fetch(
     return response.value;
 }
 
+/// Download file from URL to path
 fn download(io: Io, client: *std.http.Client, url: []const u8, path: []const u8) !void {
     var file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
@@ -349,9 +379,9 @@ fn download(io: Io, client: *std.http.Client, url: []const u8, path: []const u8)
     if (res.status != .ok) return error.HttpStatus;
 }
 
-/// Extract compressed tar archive to directory.
+/// Extract compressed tar archive to directory
 ///
-/// If `strip_components` is nonzero, the leading path components will be stripped.
+/// If `strip_components` is nonzero, the leading path components will be stripped
 fn extract(io: Io, archive: []const u8, dir: []const u8, opts: struct { strip_components: u32 = 0 }) !void {
     var flag_buf: [32]u8 = undefined;
     var argv: [6][]const u8 = undefined;
