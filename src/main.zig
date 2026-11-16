@@ -78,6 +78,7 @@ const ToolMetadata = struct {
     date: []const u8,
     url: []const u8,
     size: u32,
+    shasum: []const u8,
 
     fn fromZigIndex(index: Value, requested_version: []const u8) !ToolMetadata {
         const release = index.object.get(requested_version) orelse return error.UnknownVersion;
@@ -87,12 +88,14 @@ const ToolMetadata = struct {
         const asset = release.object.get(platform) orelse return error.UnsupportedPlatform;
         const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
         const size = (asset.object.get("size") orelse return error.BadIndex).string;
+        const shasum = (asset.object.get("shasum") orelse return error.BadIndex).string;
         return .{
             .tool = .zig,
             .version = version,
             .date = date,
             .url = url,
             .size = try std.fmt.parseInt(u32, size, 10),
+            .shasum = shasum,
         };
     }
 
@@ -102,12 +105,14 @@ const ToolMetadata = struct {
         const asset = index.object.get(platform) orelse return error.UnsupportedPlatform;
         const url = (asset.object.get("tarball") orelse return error.BadIndex).string;
         const size = (asset.object.get("size") orelse return error.BadIndex).string;
+        const shasum = (asset.object.get("shasum") orelse return error.BadIndex).string;
         return .{
             .tool = .zls,
             .version = version,
             .date = date,
             .url = url,
             .size = try std.fmt.parseInt(u32, size, 10),
+            .shasum = shasum,
         };
     }
 
@@ -117,15 +122,14 @@ const ToolMetadata = struct {
             \\  {Bi:.0}
             \\  {s}
             \\  {s}
+            \\  {s}
             \\
-        , .{
-            @tagName(self.tool), self.version, self.size, self.date, self.url,
-        });
+        , .{ @tagName(self.tool), self.version, self.size, self.date, self.url, self.shasum });
     }
 };
 
 test "tool metadata size" {
-    try std.testing.expectEqual(56, @sizeOf(ToolMetadata));
+    try std.testing.expectEqual(72, @sizeOf(ToolMetadata));
     try std.testing.expectEqual(8, @alignOf(ToolMetadata));
 }
 
@@ -200,13 +204,13 @@ fn ensure(io: Io, client: *std.http.Client, arena: std.mem.Allocator, paths: *co
     try cwd.createDirPath(io, dl);
 
     const zig_archive = try std.fs.path.join(arena, &.{ dl, "zig.tar.xz" });
-    try download(io, client, zig.url, zig_archive);
+    try download(io, client, zig.url, zig_archive, zig.shasum);
     const zig_stage = try paths.stageDir(version, .zig);
     try cwd.createDirPath(io, zig_stage);
     try extract(io, zig_archive, zig_stage, .{ .strip_components = 1 });
 
     const zls_archive = try std.fs.path.join(arena, &.{ dl, "zls.tar.xz" });
-    try download(io, client, zls.url, zls_archive);
+    try download(io, client, zls.url, zls_archive, zls.shasum);
     const zls_stage = try paths.stageDir(version, .zls);
     try cwd.createDirPath(io, zls_stage);
     try extract(io, zls_archive, zls_stage, .{});
@@ -360,18 +364,28 @@ fn fetch(
 }
 
 /// Download file from URL to path
-fn download(io: Io, client: *std.http.Client, url: []const u8, path: []const u8) !void {
+fn download(io: Io, client: *std.http.Client, url: []const u8, path: []const u8, shasum: []const u8) !void {
     var file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
 
-    var buf: [64 * 1024]u8 = undefined;
-    var fw: Io.File.Writer = .init(file, io, &buf);
+    var fw_buf: [64 * 1024]u8 = undefined;
+    var fw: Io.File.Writer = .init(file, io, &fw_buf);
+
+    var hash_buf: [4096]u8 = undefined;
+    var hashed: Io.Writer.Hashed(std.crypto.hash.sha2.Sha256) =
+        .initHasher(&fw.interface, std.crypto.hash.sha2.Sha256.init(.{}), &hash_buf);
+
     const res = try client.fetch(.{
         .location = .{ .url = url },
-        .response_writer = &fw.interface,
+        .response_writer = &hashed.writer,
     });
-    try fw.interface.flush();
     if (res.status != .ok) return error.HttpStatus;
+
+    try hashed.writer.flush();
+    try fw.interface.flush();
+
+    const digest = std.fmt.bytesToHex(hashed.hasher.finalResult(), .lower);
+    if (!std.ascii.eqlIgnoreCase(&digest, shasum)) return error.ChecksumMismatch;
 }
 
 /// Extract compressed tar archive to directory
