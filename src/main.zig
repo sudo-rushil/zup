@@ -148,10 +148,6 @@ const Paths = struct {
         return std.fs.path.join(paths.arena, &.{ paths.zup_root, version });
     }
 
-    fn toolDir(paths: *const Paths, version: []const u8, tool: Tool) ![]const u8 {
-        return std.fs.path.join(paths.arena, &.{ paths.zup_root, version, @tagName(tool) });
-    }
-
     fn exe(paths: *const Paths, version: []const u8, tool: Tool) ![]const u8 {
         return std.fs.path.join(paths.arena, &.{ paths.zup_root, version, @tagName(tool), @tagName(tool) });
     }
@@ -178,7 +174,6 @@ test "paths initialize" {
     try std.testing.expectEqualStrings("/home/.zig/zup", paths.zup_root);
     try std.testing.expectEqualStrings("/home/.zig/bin", paths.bin_dir);
     try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1", try paths.versionDir(version));
-    try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1/zig", try paths.toolDir(version, .zig));
     try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1/zls/zls", try paths.exe(version, .zls));
     try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1.installing", try paths.staging(version));
     try std.testing.expectEqualStrings("/home/.zig/zup/0.17.1.installing/zig", try paths.stageDir(version, .zig));
